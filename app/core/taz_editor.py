@@ -17,8 +17,6 @@ class TazEditorError(RuntimeError):
 
 
 class TazEditorLauncher:
-    """Подготавливает рабочие файлы проекта и запускает NetEdit для редактирования TAZ."""
-
     def __init__(
         self,
         runner: SumoRunner,
@@ -42,7 +40,6 @@ class TazEditorLauncher:
 
         workspace.mkdir(parents=True, exist_ok=True)
 
-        # Исходный OSM сохраняем в рабочей папке.
         source_osm = workspace / "source.osm"
 
         if osm_file != source_osm.resolve() and not source_osm.exists():
@@ -53,8 +50,6 @@ class TazEditorLauncher:
                 f"Не найден исходный файл карты: {source_osm}"
             )
 
-        # Сеть должна быть предварительно экспортирована
-        # отдельной кнопкой в интерфейсе.
         network = workspace / "network.net.xml"
 
         if not network.is_file():
@@ -64,8 +59,6 @@ class TazEditorLauncher:
                 f"Ожидаемый файл:\n{network}"
             )
 
-        # Не копируем старые зоны из sample_data.
-        # Если зон ещё нет, создаём пустой файл для NetEdit.
         taz_file = workspace / "sumo.add.xml"
 
         if not taz_file.is_file():
@@ -107,7 +100,6 @@ class TazEditorLauncher:
     ) -> None:
         executable = self.runner.executable("netedit")
 
-        # Если указан каталог SUMO, проверяем наличие NetEdit в нём.
         if self.runner.sumo_bin:
             executable_path = Path(executable)
             if not executable_path.is_file():

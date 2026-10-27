@@ -20,29 +20,32 @@ from PySide6.QtWidgets import (
 
 
 class MatrixEditorDialog(QDialog):
-    """Создание, загрузка, редактирование и сохранение матрицы TAZ."""
-
     def __init__(
         self,
         parent=None,
         taz_path: str = "",
         matrix_path: str = "",
+        project_path: str | None = None,
     ):
         super().__init__(parent)
 
         self.setWindowTitle("Матрица корреспонденций")
         self.resize(1000, 650)
 
+        self.project_path = Path(project_path).resolve() if project_path else None
         self.zone_ids: list[str] = []
         self.begin = 0
         self.end = 3600
         self.saved_path: Path | None = None
 
         self.taz_path_edit = QLineEdit(taz_path)
+        if self.project_path:
+            self.taz_path_edit.setReadOnly(True)
         self.matrix_path_edit = QLineEdit(matrix_path)
 
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
+        self.table.itemChanged.connect(self._refresh_demand_summary)
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeToContents
         )
@@ -55,9 +58,14 @@ class MatrixEditorDialog(QDialog):
             "или загрузите существующую."
         )
         self.status_label.setWordWrap(True)
+        self.demand_label = QLabel('Спрос: —')
+        self.demand_label.setWordWrap(True)
+        self.demand_label.setStyleSheet('font-weight: 600; color: #2155a2; padding: 5px;')
 
         choose_taz_button = QPushButton("Обзор…")
         choose_taz_button.clicked.connect(self.choose_taz)
+        if self.project_path:
+            choose_taz_button.setEnabled(False)
 
         choose_matrix_button = QPushButton("Обзор…")
         choose_matrix_button.clicked.connect(self.choose_matrix)
@@ -68,7 +76,7 @@ class MatrixEditorDialog(QDialog):
         load_button = QPushButton("Загрузить матрицу")
         load_button.clicked.connect(self.load_matrix)
 
-        save_button = QPushButton("Сохранить как…")
+        save_button = QPushButton("Сохранить в проект" if self.project_path else "Сохранить как…")
         save_button.clicked.connect(self.save_matrix)
 
         close_button = QPushButton("Закрыть")
@@ -99,7 +107,14 @@ class MatrixEditorDialog(QDialog):
         layout.addLayout(actions)
 
         layout.addWidget(self.status_label)
+        layout.addWidget(self.demand_label)
         layout.addWidget(self.table, 1)
+
+        if self.project_path:
+            if Path(matrix_path).is_file():
+                self.load_matrix()
+            else:
+                self.create_new()
 
     def choose_taz(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -259,6 +274,7 @@ class MatrixEditorDialog(QDialog):
 
     def _build_table(self, values: dict[tuple[str, str], int]):
         size = len(self.zone_ids)
+        self.table.blockSignals(True)
         self.table.clear()
         self.table.setRowCount(size)
         self.table.setColumnCount(size)
@@ -270,6 +286,38 @@ class MatrixEditorDialog(QDialog):
                 value = values.get((origin, destination), 0)
                 item = QTableWidgetItem(str(value))
                 self.table.setItem(row, column, item)
+        self.table.blockSignals(False)
+        self._refresh_demand_summary()
+
+    def _refresh_demand_summary(self, *args):
+        if not self.zone_ids:
+            self.demand_label.setText('Спрос: —')
+            return
+        total = 0
+        invalid = 0
+        for row in range(self.table.rowCount()):
+            for col in range(self.table.columnCount()):
+                item = self.table.item(row, col)
+                raw = item.text().strip() if item else ''
+                try:
+                    value = int(raw or '0')
+                    if value < 0:
+                        raise ValueError
+                    total += value
+                except ValueError:
+                    invalid += 1
+        hours = (self.end - self.begin) / 3600
+        if hours <= 0:
+            self.demand_label.setText('Некорректный интервал спроса.')
+            return
+        hourly = total / hours
+        verdict = (' • Очень редкий поток для визуального наблюдения' if 0 < hourly < 60
+                   else ' • Нулевой спрос' if total == 0 else '')
+        bad = f' • Некорректных ячеек: {invalid}' if invalid else ''
+        self.demand_label.setText(
+            f'Всего: {total} поездок за {(self.end-self.begin)/60:.0f} мин. '
+            f'Средняя интенсивность: {hourly:.1f} авто/ч ({hourly/60:.2f} авто/мин).'
+            + verdict + bad)
 
     def save_matrix(self):
         if not self.zone_ids:
@@ -318,12 +366,11 @@ class MatrixEditorDialog(QDialog):
             / "matrix_taz.xml"
         )
 
-        path_text, _ = QFileDialog.getSaveFileName(
-            self,
-            "Сохранить матрицу",
-            default_path,
-            "XML-файлы (*.xml)",
-        )
+        if self.project_path:
+            path_text = str(self.project_path / "matrix_taz.xml")
+        else:
+            path_text, _ = QFileDialog.getSaveFileName(
+                self, "Сохранить матрицу", default_path, "XML-файлы (*.xml)")
 
         if not path_text:
             return
