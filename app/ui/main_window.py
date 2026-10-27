@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import traceback
 from pathlib import Path
 
@@ -14,6 +15,14 @@ from PySide6.QtWidgets import (
 from app.core.pipeline import ModelPipeline, PipelineInputs, PipelineResult, PipelineError
 from app.core.sumo_runner import SumoRunner
 
+from app.ui.matrix_editor import MatrixEditorDialog
+
+import shutil
+from pathlib import Path
+
+from PySide6.QtWidgets import QMessageBox
+
+from app.core.taz_editor import TazEditorLauncher, TazEditorError
 
 class PipelineWorker(QObject):
     finished = Signal(object)
@@ -62,11 +71,12 @@ class FileRow(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SUMO Model Preparation — demo 0.1")
+        self.setWindowTitle("SUMO Model Preparation")
         self.resize(980, 720)
         self.worker_thread: QThread | None = None
         self.worker: PipelineWorker | None = None
         self.last_result: PipelineResult | None = None
+        self.exported_network: Path | None = None
         self._build_ui()
         self._apply_style()
         self._load_practice_defaults()
@@ -114,10 +124,33 @@ class MainWindow(QMainWindow):
         grid.addWidget(out_button, 1, 2)
         root.addWidget(settings)
 
-        actions = QHBoxLayout()
-        practice_button = QPushButton("Загрузить дефолтные файлы")
-        practice_button.clicked.connect(self._load_practice_defaults)
+        actions = QHBoxLayout() 
+        
+        practice_button = QPushButton("Загрузить дефолтные файлы") 
+        practice_button.clicked.connect(self._load_practice_defaults) 
+        
+        self.export_network_button = QPushButton("ЭКСПОРТИРОВАТЬ СЕТЬ OSM") 
+        self.export_network_button.setMinimumHeight(46) 
+        self.export_network_button.clicked.connect(self.export_network) 
+
+        self.open_network_button = QPushButton("ОТКРЫТЬ СЕТЬ В SUMO")
+        self.open_network_button.setMinimumHeight(46)
+        self.open_network_button.setEnabled(False)
+        self.open_network_button.clicked.connect(
+            self.launch_exported_network
+        )
+
+        self.matrix_editor_button = QPushButton("МАТРИЦА КОРРЕСПОНДЕНЦИЙ")
+        self.matrix_editor_button.setMinimumHeight(46)
+        self.matrix_editor_button.clicked.connect(
+            self.open_matrix_editor
+        )
+        
+        self.edit_taz_button = QPushButton("РЕДАКТИРОВАТЬ TAZ-ЗОНЫ")
+        self.edit_taz_button.clicked.connect(self.edit_taz_zones)
+
         self.prepare_button = QPushButton("ПОДГОТОВИТЬ МОДЕЛЬ")
+        
         self.prepare_button.setObjectName("primary")
         self.prepare_button.setMinimumHeight(46)
         self.prepare_button.clicked.connect(self.prepare)
@@ -125,9 +158,14 @@ class MainWindow(QMainWindow):
         self.sumo_button.setMinimumHeight(46)
         self.sumo_button.setEnabled(False)
         self.sumo_button.clicked.connect(self.launch_sumo)
-        actions.addWidget(practice_button, 1)
-        actions.addWidget(self.prepare_button, 2)
-        actions.addWidget(self.sumo_button, 1)
+        
+        actions.addWidget(practice_button, 1) 
+        actions.addWidget(self.export_network_button, 2) 
+        actions.addWidget(self.open_network_button, 2)
+        actions.addWidget(self.matrix_editor_button, 2)
+        actions.addWidget(self.edit_taz_button, 2)
+        actions.addWidget(self.prepare_button, 2) 
+        actions.addWidget(self.sumo_button, 1) 
         root.addLayout(actions)
 
         stats = QGroupBox("Результат")
@@ -166,6 +204,99 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Готово")
 
+    def edit_taz_zones(self):
+        osm_text = self.osm_row.edit.text().strip()
+        taz_text = self.taz_row.edit.text().strip()
+        matrix_text = self.matrix_row.edit.text().strip()
+
+        if not osm_text:
+            QMessageBox.warning(
+                self,
+                "Не выбран OSM",
+                "Сначала загрузите файл OpenStreetMap."
+            )
+            return
+
+        osm_file = Path(osm_text)
+
+        if not osm_file.is_file():
+            QMessageBox.warning(
+                self,
+                "Файл не найден",
+                f"Не найден файл OSM:\n{osm_file}"
+            )
+            return
+
+        # Используем папку результатов, заданную пользователем.
+        # Если она не указана, создаём проект рядом с исходным OSM.
+        output_text = self.output_dir.text().strip()
+        if output_text:
+            workspace = Path(output_text)
+        else:
+            workspace = osm_file.parent / "sumo_network_export"
+
+        working_taz = workspace / "sumo.add.xml"
+
+        # Если рабочего файла зон ещё нет и исходный файл не выбран,
+        # сначала спрашиваем разрешение создать его.
+        if not working_taz.exists() and not taz_text:
+            answer = QMessageBox.question(
+                self,
+                "Создать TAZ-зоны?",
+                "В рабочей папке нет файла зон.\n\n"
+                "Создать новый файл и открыть NetEdit для "
+                "редактирования зон?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        original_taz = Path(taz_text) if taz_text else None
+
+        try:
+            runner = SumoRunner(
+                self.sumo_bin.text().strip() or None,
+                self.append_log,
+            )
+
+            launcher = TazEditorLauncher(
+                runner,
+                log=self.append_log,
+            )
+
+            network, taz_file = launcher.prepare_workspace(
+                osm_file=osm_file,
+                original_taz_file=original_taz,
+                workspace=workspace,
+            )
+
+            # При первом создании проекта переносим исходную матрицу
+            # в рабочую папку, чтобы все данные проекта лежали вместе.
+            working_matrix = workspace / "matrix_taz.xml"
+
+            self.taz_row.edit.setText(str(taz_file))
+
+            if working_matrix.is_file():
+                self.matrix_row.edit.setText(str(working_matrix))
+            else:
+                self.matrix_row.edit.clear()
+
+            # Обновляем поля: дальше приложение работает с копиями проекта.
+            self.taz_row.edit.setText(str(taz_file))
+            if working_matrix.exists():
+                self.matrix_row.edit.setText(str(working_matrix))
+
+            launcher.open_editor(network, taz_file)
+
+        except (TazEditorError, OSError, ValueError) as exc:
+            QMessageBox.critical(
+                self,
+                "Ошибка редактирования TAZ",
+                str(exc),
+            )
+
     def _apply_style(self):
         self.setStyleSheet("""
             QMainWindow, QWidget { background: #f5f7fa; color: #172033; }
@@ -202,6 +333,140 @@ class MainWindow(QMainWindow):
         if path:
             self.output_dir.setText(path)
 
+    def get_project_dir(self, osm_file: Path) -> Path:
+        output_text = self.output_dir.text().strip()
+
+        # Если пользователь указал папку вручную — используем её.
+        if output_text:
+            return Path(output_text).expanduser().resolve()
+
+        # Если сеть уже экспортирована — используем её папку.
+        exported_network = getattr(self, "exported_network", None)
+        if exported_network and Path(exported_network).is_file():
+            return Path(exported_network).resolve().parent
+
+        # Папка по умолчанию для нового проекта.
+        return Path(osm_file).resolve().parent / "sumo_network_export"
+
+    def export_network(self):
+        osm_text = self.osm_row.edit.text().strip()
+
+        if not osm_text:
+            QMessageBox.warning(
+                self,
+                "Не выбран OSM-файл",
+                "Сначала выберите файл OSM."
+            )
+            return
+
+        osm = Path(osm_text)
+
+        if not osm.is_file():
+            QMessageBox.warning(
+                self,
+                "Файл не найден",
+                f"Не удалось найти OSM-файл:\n{osm}"
+            )
+            return
+
+        output_dir = self.get_project_dir(osm)
+
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            network_file = output_dir / "network.net.xml"
+
+            sumo_bin_text = self.sumo_bin.text().strip()
+
+            if sumo_bin_text:
+                netconvert = Path(sumo_bin_text) / (
+                    "netconvert.exe" if __import__("os").name == "nt"
+                    else "netconvert"
+                )
+
+                if not netconvert.is_file():
+                    raise FileNotFoundError(
+                        f"Не найден netconvert:\n{netconvert}"
+                    )
+
+                command = str(netconvert)
+            else:
+                command = "netconvert"
+
+            args = [
+                command,
+                "--osm-files", str(osm),
+                "--output-file", str(network_file),
+            ]
+
+            self.log_box.clear()
+            self.append_log("=== Экспорт дорожной сети ===")
+            self.append_log("$ " + subprocess.list2cmdline(args))
+
+            self.export_network_button.setEnabled(False)
+            self.prepare_button.setEnabled(False)
+            self.sumo_button.setEnabled(False)
+            self.progress.show()
+
+            try:
+                process = subprocess.run(
+                    args,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=300,
+                    check=False,
+                )
+
+                if process.stdout:
+                    self.append_log(process.stdout.strip())
+
+                if process.stderr:
+                    self.append_log(process.stderr.strip())
+
+                if process.returncode != 0:
+                    raise RuntimeError(
+                        f"netconvert завершился с кодом "
+                        f"{process.returncode}."
+                    )
+
+                if not network_file.is_file():
+                    raise RuntimeError(
+                        "netconvert завершился, но файл сети не создан."
+                    )
+
+                self.exported_network = network_file
+                
+                self.open_network_button.setEnabled(True)
+
+                self.append_log(
+                    f"Сеть экспортирована: {network_file}"
+                )
+                self.statusBar().showMessage(
+                    "Экспорт дорожной сети завершён"
+                )
+
+                QMessageBox.information(
+                    self,
+                    "Экспорт завершён",
+                    f"Дорожная сеть сохранена:\n{network_file}"
+                )
+
+            finally:
+                self.progress.hide()
+                self.export_network_button.setEnabled(True)
+                self.prepare_button.setEnabled(True)
+
+        except Exception as exc:
+            self.append_log(f"ОШИБКА ЭКСПОРТА: {exc}")
+            self.statusBar().showMessage("Ошибка экспорта сети")
+            QMessageBox.critical(
+                self,
+                "Ошибка экспорта",
+                str(exc)
+            )
+
     @Slot(str)
     def append_log(self, message: str):
         self.log_box.appendPlainText(message)
@@ -210,6 +475,54 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message.replace("=== ", "").replace(" ===", "…"))
         elif message.startswith("$ "):
             self.statusBar().showMessage("Выполняется команда SUMO…")
+
+    def open_matrix_editor(self):
+        taz_text = self.taz_row.edit.text().strip()
+
+        if not taz_text:
+            QMessageBox.warning(
+                self,
+                "Не выбраны TAZ-зоны",
+                "Сначала загрузите файл зон или создайте их через NetEdit.",
+            )
+            return
+
+        taz_path = Path(taz_text)
+
+        if not taz_path.is_file():
+            QMessageBox.warning(
+                self,
+                "Файл зон не найден",
+                f"Не найден файл:\n{taz_path}",
+            )
+            return
+
+        # Рабочая матрица хранится рядом с рабочим файлом TAZ.
+        working_matrix = taz_path.parent / "matrix_taz.xml"
+
+        # Если рабочей матрицы пока нет, используем выбранную
+        # пользователем матрицу как исходную.
+        selected_matrix = self.matrix_row.edit.text().strip()
+
+        if not working_matrix.exists() and selected_matrix:
+            source = Path(selected_matrix)
+
+            if source.is_file() and source.resolve() != working_matrix.resolve():
+                shutil.copy2(source, working_matrix)
+
+        dialog = MatrixEditorDialog(
+            self,
+            taz_path=str(taz_path),
+            matrix_path=str(working_matrix),
+        )
+
+        dialog.exec()
+
+        if dialog.saved_path is not None:
+            self.matrix_row.edit.setText(str(dialog.saved_path))
+            self.append_log(
+                f"Выбрана матрица корреспонденций: {dialog.saved_path}"
+            )
 
     def prepare(self):
         osm = self.osm_row.path()
@@ -223,7 +536,23 @@ class MainWindow(QMainWindow):
             return
 
         out_text = self.output_dir.text().strip()
-        output = Path(out_text) if out_text else osm.parent / "sumo_project"
+
+        if out_text:
+            output = Path(out_text).resolve()
+        else:
+            taz_text = self.taz_row.edit.text().strip()
+
+            if taz_text:
+                taz_path = Path(taz_text).resolve()
+                # Если TAZ уже находится в рабочей папке проекта,
+                # используем эту же папку.
+                if taz_path.name == "sumo.add.xml":
+                    output = taz_path.parent
+                else:
+                    output = osm.parent / f"{osm.stem}_sumo_project"
+            else:
+                output = osm.parent / f"{osm.stem}_sumo_project"
+
         sumo_bin = self.sumo_bin.text().strip() or None
 
         self.log_box.clear()
@@ -271,15 +600,74 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.worker_thread = None
 
+    def launch_exported_network(self):
+        if not self.exported_network:
+            QMessageBox.warning(
+                self,
+                "Сеть не экспортирована",
+                "Сначала нажмите «ЭКСПОРТИРОВАТЬ СЕТЬ OSM»."
+            )
+            return
+
+        try:
+            runner = SumoRunner(
+                self.sumo_bin.text().strip() or None,
+                self.append_log,
+            )
+            runner.launch_network(self.exported_network)
+            self.statusBar().showMessage(
+                "Дорожная сеть открыта в SUMO"
+            )
+        except Exception as exc:
+            self.append_log(f"ОШИБКА ЗАПУСКА SUMO: {exc}")
+            QMessageBox.critical(
+                self,
+                "Не удалось открыть сеть",
+                str(exc),
+            )
+
+    
     def launch_sumo(self):
         if not self.last_result:
+            QMessageBox.warning(
+                self,
+                "Модель не подготовлена",
+                "Сначала нажмите «ПОДГОТОВИТЬ МОДЕЛЬ»."
+            )
             return
+
         try:
-            runner = SumoRunner(self.sumo_bin.text().strip() or None, self.append_log)
-            ModelPipeline(runner, self.append_log).launch_sumo(self.last_result.config)
-            self.statusBar().showMessage("SUMO запущен")
+            runner = SumoRunner(
+                self.sumo_bin.text().strip() or None,
+                self.append_log,
+            )
+
+            config = self.last_result.config.resolve()
+
+            if not config.is_file():
+                raise FileNotFoundError(
+                    f"Конфигурация модели не найдена:\n{config}"
+                )
+
+            self.append_log(f"Запуск модели из проекта: {config.parent}")
+
+            ModelPipeline(
+                runner,
+                self.append_log
+            ).launch_sumo(config)
+
+            self.statusBar().showMessage(
+                f"SUMO запущен: {config.parent}"
+            )
+
         except Exception as exc:
-            QMessageBox.critical(self, "Не удалось запустить SUMO", str(exc))
+            self.append_log(f"ОШИБКА ЗАПУСКА SUMO: {exc}")
+            QMessageBox.critical(
+                self,
+                "Не удалось запустить SUMO",
+                str(exc)
+            )
+
 
     def closeEvent(self, event):
         if self.worker_thread and self.worker_thread.isRunning():

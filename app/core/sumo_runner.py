@@ -91,3 +91,26 @@ class SumoRunner:
     @staticmethod
     def _quote(value: str) -> str:
         return f'"{value}"' if " " in value else value
+
+    def launch_network(self, network_file: Path) -> subprocess.Popen:
+        network_file = Path(network_file).resolve()
+
+        if not network_file.is_file():
+            raise FileNotFoundError(
+                f"Файл дорожной сети не найден:\n{network_file}"
+            )
+
+        command = [
+            self.executable("sumo-gui"),
+            "-n",
+            str(network_file),
+        ]
+
+        self.log("$ " + " ".join(self._quote(x) for x in command))
+
+        return subprocess.Popen(
+            command,
+            cwd=str(network_file.parent),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+

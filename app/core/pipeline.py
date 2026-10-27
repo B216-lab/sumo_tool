@@ -55,21 +55,52 @@ class ModelPipeline:
 
         self.log("=== 1. Подготовка проекта ===")
         osm = self._copy_input(inputs.osm, out / "source.osm")
-        taz = self._copy_input(inputs.taz, out / "sumo.add.xml")
-        matrix = self._copy_input(inputs.matrix, out / "matrix_taz.xml")
 
+        taz = out / "sumo.add.xml"
+        if not taz.exists():
+            source_taz = Path(inputs.taz).resolve()
+            if source_taz != taz.resolve():
+                self._copy_input(source_taz, taz)
+            else:
+                raise PipelineError(f"Не найден рабочий файл TAZ: {taz}")
+        else:
+            self.log(f"Используется рабочий файл TAZ: {taz}")
+
+        matrix = out / "matrix_taz.xml"
+        if not matrix.exists():
+            source_matrix = Path(inputs.matrix).resolve()
+            if source_matrix != matrix.resolve():
+                self._copy_input(source_matrix, matrix)
+            else:
+                raise PipelineError(f"Не найдена матрица: {matrix}")
+        else:
+            self.log(f"Используется рабочая матрица: {matrix}")
+
+                
         network = out / "network.net.xml"
         trips = out / "trips.trips.xml"
         routes = out / "routes.rou.xml"
         config = out / "sumo.sumocfg"
 
-        self.log("=== 2. OSM → SUMO network (netconvert) ===")
-        result = self.runner.run([
-            self.runner.executable("netconvert"),
-            "--osm-files", str(osm),
-            "-o", str(network),
-        ], cwd=out)
-        self._require_success(result, "netconvert")
+        self.log("=== 2. Проверка сети SUMO ===")
+
+        if network.is_file():
+            self.log(f"Используется существующая сеть проекта: {network}")
+            self.log("Сеть не пересоздаётся, чтобы сохранить соответствие рёбер и TAZ.")
+        else:
+            self.log("Сеть проекта отсутствует. Создание из OSM через netconvert...")
+            result = self.runner.run([
+                self.runner.executable("netconvert"),
+                "--osm-files", str(osm),
+                "-o", str(network),
+            ], cwd=out)
+            self._require_success(result, "netconvert")
+
+            if not network.is_file():
+                raise PipelineError(
+                    f"netconvert завершился без создания файла сети: {network}"
+                )
+
 
         self.log("=== 3. Матрица TAZ → поездки (od2trips) ===")
         result = self.runner.run([
@@ -93,9 +124,28 @@ class ModelPipeline:
         if result.returncode != 0:
             raise PipelineError(self._format_command_error("duarouter", result))
 
+        
         warnings = self._count_warnings(result.stdout + "\n" + result.stderr)
         trip_count = self._count_xml_elements(trips, "trip")
         route_count = self._count_xml_elements(routes, "vehicle")
+
+        self.log(f"Создано поездок: {trip_count}")
+        self.log(f"Создано маршрутов: {route_count}")
+
+        if trip_count == 0:
+            raise PipelineError(
+                "Матрица не создала ни одной поездки. "
+                "Проверьте файл TAZ и матрицу соответствий."
+            )
+
+        if route_count == 0:
+            raise PipelineError(
+                "duarouter не создал ни одного маршрута. "
+                "Подготовка остановлена: проверьте соответствие рёбер "
+                "в файлах TAZ и trips.trips.xml текущей сети network.net.xml. "
+                "Конфигурация запуска не создана."
+            )
+
 
         self.log("=== 5. Создание конфигурации SUMO ===")
         self._write_config(config, network, routes, taz, inputs.begin, 200)
@@ -129,6 +179,17 @@ class ModelPipeline:
 
     @staticmethod
     def _copy_input(source: Path, destination: Path) -> Path:
+        source = Path(source).resolve()
+        destination = Path(destination).resolve()
+
+        if source == destination:
+            if not destination.exists():
+                raise PipelineError(f"Файл не найден: {destination}")
+            return destination
+
+        if not source.is_file():
+            raise PipelineError(f"Файл не найден: {source}")
+
         shutil.copy2(source, destination)
         return destination
 
